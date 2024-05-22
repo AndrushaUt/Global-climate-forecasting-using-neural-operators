@@ -9,11 +9,11 @@ import torch.nn as nn
 from torch.nn import functional as F
 import torch.utils.checkpoint as cp
 
-from utils.layers import PatchEmbed, DropPath
+from pde.utils.layers import PatchEmbed, DropPath
 
 logger = logging.getLogger(__name__)
 
-T_MAX = 256
+T_MAX = 320
 
 from torch.utils.cpp_extension import load
 wkv_cuda = load(name="wkv", 
