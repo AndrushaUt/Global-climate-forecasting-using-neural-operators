@@ -2,9 +2,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from timm.layers.helpers import to_2tuple
+from timm.models.swin_transformer_v2 import SwinTransformerV2Stage
 
 from utils_for_models.pad import get_pad2d
-from .vrwkv import VRWKV
+from .vrwkv import VRWKV, Block
+
+from neuralop.models import FNO2d
 
 
 class CubeEmbedding(nn.Module):
@@ -65,7 +68,6 @@ class DownBlock(nn.Module):
             res = res[:, :, :, :-1]
         return res
 
-
 class UpBlock(nn.Module):
     def __init__(self, in_chans, out_chans, num_groups, num_residuals=2):
         super().__init__()
@@ -89,55 +91,55 @@ class UpBlock(nn.Module):
         return x + shortcut
 
 
-# class UTransformer(nn.Module):
-#     """U-Transformer
-#     Args:
-#         embed_dim (int): Patch embedding dimension.
-#         num_groups (int | tuple[int]): number of groups to separate the channels into.
-#         input_resolution (tuple[int]): Lat, Lon.
-#         num_heads (int): Number of attention heads in different layers.
-#         window_size (int | tuple[int]): Window size.
-#         depth (int): Number of blocks.
-#     """
-#     def __init__(self, embed_dim, num_groups, input_resolution, num_heads, window_size, depth):
-#         super().__init__()
-#         num_groups = to_2tuple(num_groups)
-#         window_size = to_2tuple(window_size)
-#         padding = get_pad2d(input_resolution, window_size)
-#         padding_left, padding_right, padding_top, padding_bottom = padding
-#         self.padding = padding
-#         self.pad = nn.ZeroPad2d(padding)
-#         input_resolution = list(input_resolution)
-#         input_resolution[0] = input_resolution[0] + padding_top + padding_bottom
-#         input_resolution[1] = input_resolution[1] + padding_left + padding_right
-#         self.down = DownBlock(embed_dim, embed_dim, num_groups[0])
-#          self.layer = SwinTransformerV2Stage(embed_dim, embed_dim, input_resolution, depth, num_heads, window_size)
-#         self.up = UpBlock(embed_dim * 2, embed_dim, num_groups[1])
+class UTransformer(nn.Module):
+    """U-Transformer
+    Args:
+        embed_dim (int): Patch embedding dimension.
+        num_groups (int | tuple[int]): number of groups to separate the channels into.
+        input_resolution (tuple[int]): Lat, Lon.
+        num_heads (int): Number of attention heads in different layers.
+        window_size (int | tuple[int]): Window size.
+        depth (int): Number of blocks.
+    """
+    def __init__(self, embed_dim, num_groups, input_resolution, num_heads, window_size, depth):
+        super().__init__()
+        num_groups = to_2tuple(num_groups)
+        window_size = to_2tuple(window_size)
+        padding = get_pad2d(input_resolution, window_size)
+        padding_left, padding_right, padding_top, padding_bottom = padding
+        self.padding = padding
+        self.pad = nn.ZeroPad2d(padding)
+        input_resolution = list(input_resolution)
+        input_resolution[0] = input_resolution[0] + padding_top + padding_bottom
+        input_resolution[1] = input_resolution[1] + padding_left + padding_right
+        self.down = DownBlock(embed_dim, embed_dim, num_groups[0])
+        self.layer = SwinTransformerV2Stage(embed_dim, embed_dim, input_resolution, depth, num_heads, window_size)
+        self.up = UpBlock(embed_dim * 2, embed_dim, num_groups[1])
 
-#     def forward(self, x, t):
-#         B, C, Lat, Lon = x.shape
-#         padding_left, padding_right, padding_top, padding_bottom = self.padding
-#         x = self.down(x)
+    def forward(self, x, t):
+        B, C, Lat, Lon = x.shape
+        padding_left, padding_right, padding_top, padding_bottom = self.padding
+        x = self.down(x)
 
-#         shortcut = x
+        shortcut = x
 
-#         # pad
-#         x = self.pad(x)
-#         _, _, pad_lat, pad_lon = x.shape
+        # pad
+        x = self.pad(x)
+        _, _, pad_lat, pad_lon = x.shape
 
-#         x = x.permute(0, 2, 3, 1)  # B Lat Lon C
-#         x = x + t
-#         x = self.layer(x)
-#         x = x.permute(0, 3, 1, 2)
+        x = x.permute(0, 2, 3, 1)  # B Lat Lon C
+        x = x + t
+        x = self.layer(x)
+        x = x.permute(0, 3, 1, 2)
 
-#         # crop
-#         x = x[:, :, padding_top: pad_lat - padding_bottom, padding_left: pad_lon - padding_right]
+        # crop
+        x = x[:, :, padding_top: pad_lat - padding_bottom, padding_left: pad_lon - padding_right]
 
-#         # concat
-#         x = torch.cat([shortcut, x], dim=1)  # B 2*C Lat Lon
+        # concat
+        x = torch.cat([shortcut, x], dim=1)  # B 2*C Lat Lon
 
-#         x = self.up(x)
-#         return x
+        x = self.up(x)
+        return x
 
 
 class UTransformerVRKWV(nn.Module):
@@ -150,7 +152,7 @@ class UTransformerVRKWV(nn.Module):
         window_size (int | tuple[int]): Window size.
         depth (int): Number of blocks.
     """
-    def __init__(self, img_size, patch_size, embed_dim, in_chans, num_groups, input_resolution, num_heads, window_size, depth):
+    def __init__(self, img_size, patch_size, embed_dim, in_chans, num_groups, input_resolution, num_heads, window_size, depth, post_norm):
         super().__init__()
         num_groups = to_2tuple(num_groups)
         window_size = to_2tuple(window_size)
@@ -161,10 +163,10 @@ class UTransformerVRKWV(nn.Module):
         input_resolution = list(input_resolution)
         input_resolution[0] = input_resolution[0] + padding_top + padding_bottom
         input_resolution[1] = input_resolution[1] + padding_left + padding_right
-        self.down = DownBlock(embed_dim, embed_dim, num_groups[0])
-        self.layer = VRWKV((img_size[1],img_size[2]), patch_size, 7, embed_dims=embed_dim, depth=depth)
+        self.down = DownBlockFNO(embed_dim, embed_dim, num_groups[0])
+        self.layer = VRWKV((img_size[1],img_size[2]), patch_size, 14, embed_dims=embed_dim, depth=depth, post_norm=post_norm)
         # self.layer = Block(embed_dim, depth, 0)
-        self.up = UpBlock(embed_dim * 2, embed_dim, num_groups[1])
+        self.up = UpBlockFNO(embed_dim * 2, embed_dim, num_groups[1])
 
     def forward(self, x, t):
         B, C, Lat, Lon = x.shape
@@ -185,63 +187,67 @@ class UTransformerVRKWV(nn.Module):
         x = x + t
         x = self.layer(x)[0]
         # print(x.shape, "После VRWKV")
-
+        
+        print(x.shape)
+        
         # crop
         x = x[:, :, padding_top - 1: pad_lat - padding_bottom, padding_left: pad_lon - padding_right]
 
         # concat
         # print(shortcut.shape, x.shape)
+        print(shortcut.shape, x.shape)
+        # x = torch.nn.functional.pad(x, (0,0,2,0))
         x = torch.cat([shortcut, x], dim=1)  # B 2*C Lat Lon
 
         x = self.up(x)
         return x
 
 
-# class FuxiV2(nn.Module):
-#     """
-#     Args:
-#         img_size (Sequence[int], optional): T, Lat, Lon.
-#         patch_size (Sequence[int], optional): T, Lat, Lon.
-#         in_chans (int, optional): number of input channels.
-#         out_chans (int, optional): number of output channels.
-#         embed_dim (int, optional): number of embed channels.
-#         num_groups (Sequence[int] | int, optional): number of groups to separate the channels into.
-#         num_heads (int, optional): Number of attention heads.
-#         window_size (int | tuple[int], optional): Local window size.
-#     """
-#     def __init__(self, img_size=(2, 721, 1440), patch_size=(2, 4, 4), in_chans=70, out_chans=70,
-#                  embed_dim=1536, num_groups=32, num_heads=8, window_size=7):
-#         super().__init__()
-#         input_resolution = int(img_size[1] / patch_size[1] / 2), int(img_size[2] / patch_size[2] / 2)
-#         self.cube_embedding = CubeEmbedding(img_size, patch_size, in_chans, embed_dim)
-#         self.u_transformer = UTransformerVRKWV(img_size, patch_size, embed_dim, in_chans, num_groups, input_resolution, num_heads, window_size, depth=48)
-#         self.fc = nn.Linear(embed_dim, out_chans * patch_size[1] * patch_size[2])
-#         self.t_embed = nn.Linear(1, embed_dim)
+class FuxiV2(nn.Module):
+    """
+    Args:
+        img_size (Sequence[int], optional): T, Lat, Lon.
+        patch_size (Sequence[int], optional): T, Lat, Lon.
+        in_chans (int, optional): number of input channels.
+        out_chans (int, optional): number of output channels.
+        embed_dim (int, optional): number of embed channels.
+        num_groups (Sequence[int] | int, optional): number of groups to separate the channels into.
+        num_heads (int, optional): Number of attention heads.
+        window_size (int | tuple[int], optional): Local window size.
+    """
+    def __init__(self, img_size=(2, 721, 1440), patch_size=(2, 4, 4), in_chans=70, out_chans=70,
+                 embed_dim=1536, num_groups=32, num_heads=8, window_size=7, depth=48):
+        super().__init__()
+        input_resolution = int(img_size[1] / patch_size[1] / 2), int(img_size[2] / patch_size[2] / 2)
+        self.cube_embedding = CubeEmbedding(img_size, patch_size, in_chans, embed_dim)
+        self.u_transformer = UTransformer(embed_dim, num_groups, input_resolution, num_heads, window_size, depth=depth)
+        self.fc = nn.Linear(embed_dim, out_chans * patch_size[1] * patch_size[2])
+        self.t_embed = nn.Linear(1, embed_dim)
 
-#         self.patch_size = patch_size
-#         self.input_resolution = input_resolution
-#         self.out_chans = out_chans
-#         self.img_size = img_size
+        self.patch_size = patch_size
+        self.input_resolution = input_resolution
+        self.out_chans = out_chans
+        self.img_size = img_size
 
-#     def forward(self, x: torch.Tensor, t: torch.Tensor):
-#         B, _, _, _, _ = x.shape
-#         _, patch_lat, patch_lon = self.patch_size
-#         Lat, Lon = self.input_resolution
-#         Lat, Lon = Lat * 2, Lon * 2
-#         x = self.cube_embedding(x).squeeze(2)  # B C Lat Lon
-#         t = self.t_embed(t).unsqueeze(1).unsqueeze(1)
-#         x = self.u_transformer(x, t)
-#         x = self.fc(x.permute(0, 2, 3, 1))  # B Lat Lon C
-#         x = x.reshape(B, Lat, Lon, patch_lat, patch_lon, self.out_chans).permute(0, 1, 3, 2, 4, 5)
-#         # B, lat, patch_lat, lon, patch_lon, C
+    def forward(self, x: torch.Tensor, t: torch.Tensor):
+        B, _, _, _, _ = x.shape
+        _, patch_lat, patch_lon = self.patch_size
+        Lat, Lon = self.input_resolution
+        Lat, Lon = Lat * 2, Lon * 2
+        x = self.cube_embedding(x).squeeze(2)  # B C Lat Lon
+        t = self.t_embed(t).unsqueeze(1).unsqueeze(1)
+        x = self.u_transformer(x, t)
+        x = self.fc(x.permute(0, 2, 3, 1))  # B Lat Lon C
+        x = x.reshape(B, Lat, Lon, patch_lat, patch_lon, self.out_chans).permute(0, 1, 3, 2, 4, 5)
+        # B, lat, patch_lat, lon, patch_lon, C
 
-#         x = x.reshape(B, Lat * patch_lat, Lon * patch_lon, self.out_chans)
-#         x = x.permute(0, 3, 1, 2)  # B C Lat Lon
+        x = x.reshape(B, Lat * patch_lat, Lon * patch_lon, self.out_chans)
+        x = x.permute(0, 3, 1, 2)  # B C Lat Lon
 
-#         # bilinear
-#         x = F.interpolate(x, size=self.img_size[1:], mode="bilinear")
+        # bilinear
+        x = F.interpolate(x, size=self.img_size[1:], mode="bilinear")
 
-#         return x
+        return x
 
 
 class FuxiV2VRWKV(nn.Module):
@@ -257,11 +263,11 @@ class FuxiV2VRWKV(nn.Module):
         window_size (int | tuple[int], optional): Local window size.
     """
     def __init__(self, img_size=(2, 721, 1440), patch_size=(2, 4, 4), in_chans=70, out_chans=70,
-                 embed_dim=1536, num_groups=32, num_heads=8, window_size=7):
+                 embed_dim=1536, num_groups=32, num_heads=8, window_size=7, depth=48, post_norm=False):
         super().__init__()
         input_resolution = int(img_size[1] / patch_size[1] / 2), int(img_size[2] / patch_size[2] / 2)
         self.cube_embedding = CubeEmbedding(img_size, patch_size, in_chans, embed_dim)
-        self.u_transformer = UTransformerVRKWV(img_size, patch_size, embed_dim, in_chans, num_groups, input_resolution, num_heads, window_size, depth=48)
+        self.u_transformer = UTransformerVRKWV(img_size, patch_size, embed_dim, in_chans, num_groups, input_resolution, num_heads, window_size, depth=depth, post_norm=post_norm)
         self.fc = nn.Linear(embed_dim, out_chans * patch_size[1] * patch_size[2])
         self.t_embed = nn.Linear(1, embed_dim)
 
@@ -282,6 +288,8 @@ class FuxiV2VRWKV(nn.Module):
         # print(t.shape, "t после t_embed")
         x = self.u_transformer(x, t)
         x = self.fc(x.permute(0, 2, 3, 1))  # B Lat Lon C
+        # print(x.shape)
+        # print(B, Lat, Lon, patch_lat, patch_lon, self.out_chans)
         x = x.reshape(B, Lat, Lon, patch_lat, patch_lon, self.out_chans).permute(0, 1, 3, 2, 4, 5)
         # B, lat, patch_lat, lon, patch_lon, C
 
