@@ -8,6 +8,8 @@ from .functs import to_2tuple
 from .norm import build_norm_layer
 from .conv import build_conv_layer
 
+from neuralop.layers.spectral_convolution import SpectralConv
+
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
     """
@@ -251,3 +253,157 @@ class PatchEmbed(nn.Module):
         if self.norm is not None:
             x = self.norm(x)
         return x, out_size
+    
+    
+class ConvLSTMCell(nn.Module):
+    def __init__(self, in_channel, num_hidden, height, width, filter_size, stride, layer_norm):
+        super(ConvLSTMCell, self).__init__()
+
+        self.num_hidden = num_hidden
+        self.padding = filter_size // 2
+        self._forget_bias = 1.0
+        if layer_norm:
+            self.conv_x = nn.Sequential(
+                nn.Conv2d(in_channel, num_hidden * 4, kernel_size=filter_size,
+                          stride=stride, padding=self.padding, bias=False),
+                nn.LayerNorm([num_hidden * 4, height, width])
+            )
+            self.conv_h = nn.Sequential(
+                nn.Conv2d(num_hidden, num_hidden * 4, kernel_size=filter_size,
+                          stride=stride, padding=self.padding, bias=False),
+                nn.LayerNorm([num_hidden * 4, height, width])
+            )
+            self.conv_o = nn.Sequential(
+                nn.Conv2d(num_hidden * 2, num_hidden, kernel_size=filter_size,
+                          stride=stride, padding=self.padding, bias=False),
+                nn.LayerNorm([num_hidden, height, width])
+            )
+        else:
+            self.conv_x = nn.Sequential(
+                nn.Conv2d(in_channel, num_hidden * 4, kernel_size=filter_size,
+                          stride=stride, padding=self.padding, bias=False),
+            )
+            self.conv_h = nn.Sequential(
+                nn.Conv2d(num_hidden, num_hidden * 4, kernel_size=filter_size,
+                          stride=stride, padding=self.padding, bias=False),
+            )
+            self.conv_o = nn.Sequential(
+                nn.Conv2d(num_hidden * 2, num_hidden, kernel_size=filter_size,
+                          stride=stride, padding=self.padding, bias=False),
+            )
+        self.conv_last = nn.Conv2d(num_hidden * 2, num_hidden, kernel_size=1,
+                                   stride=1, padding=0, bias=False)
+
+    def forward(self, x_t, h_t, c_t):
+        x_concat = self.conv_x(x_t)
+        h_concat = self.conv_h(h_t)
+        i_x, f_x, g_x, o_x = torch.split(x_concat, self.num_hidden, dim=1)
+        i_h, f_h, g_h, o_h = torch.split(h_concat, self.num_hidden, dim=1)
+
+        i_t = torch.sigmoid(i_x + i_h)
+        f_t = torch.sigmoid(f_x + f_h)
+        g_t = torch.tanh(g_x + g_h)
+
+        c_new = f_t * c_t + i_t * g_t
+        o_t = torch.sigmoid(o_x + o_h)
+        h_new = o_t * torch.tanh(c_new)
+        return h_new, c_new
+
+
+class ConvLSTMFNOCell(nn.Module):
+    def __init__(self, in_channel, num_hidden, height, width, filter_size, stride, layer_norm):
+        super(ConvLSTMFNOCell, self).__init__()
+
+        self.num_hidden = num_hidden
+        self.padding = filter_size // 2
+        self._forget_bias = 1.0
+        if layer_norm:
+            self.conv_x = nn.Sequential(
+                SpectralConv2d(in_channel, num_hidden * 4, [10,10]),
+                nn.LayerNorm([num_hidden * 4, height, width])
+            )
+            self.conv_h = nn.Sequential(
+                SpectralConv2d(num_hidden, num_hidden * 4, [10,10]),
+                nn.LayerNorm([num_hidden * 4, height, width])
+            )
+            self.conv_o = nn.Sequential(
+                SpectralConv2d(num_hidden * 2, num_hidden, [10,10]),
+                nn.LayerNorm([num_hidden, height, width])
+            )
+        else:
+            self.conv_x = nn.Sequential(
+                SpectralConv2d(in_channel, num_hidden * 4, [10,10]),
+            )
+            self.conv_h = nn.Sequential(
+                SpectralConv2d(num_hidden, num_hidden * 4, [10,10]),
+            )
+            self.conv_o = nn.Sequential(
+                SpectralConv2d(num_hidden * 2, num_hidden, [10,10]),
+            )
+        self.conv_last = SpectralConv2d(num_hidden * 2, num_hidden, [10,10])
+
+    def forward(self, x_t, h_t, c_t):
+        x_concat = self.conv_x(x_t)
+        h_concat = self.conv_h(h_t)
+        i_x, f_x, g_x, o_x = torch.split(x_concat, self.num_hidden, dim=1)
+        i_h, f_h, g_h, o_h = torch.split(h_concat, self.num_hidden, dim=1)
+
+        i_t = torch.sigmoid(i_x + i_h)
+        f_t = torch.sigmoid(f_x + f_h)
+        g_t = torch.tanh(g_x + g_h)
+
+        c_new = f_t * c_t + i_t * g_t
+        o_t = torch.sigmoid(o_x + o_h)
+        h_new = o_t * torch.tanh(c_new)
+        return h_new, c_new
+    
+class SpectralConv2d(SpectralConv):
+        
+    def forward(self, x, indices=0):
+        batchsize, channels, height, width = x.shape
+
+        x = torch.fft.rfft2(x.float(), norm=self.fft_norm, dim=(-2, -1))
+
+        # The output will be of size (batch_size, self.out_channels,
+        # x.size(-2), x.size(-1)//2 + 1)
+        out_fft = torch.zeros(
+            [batchsize, self.out_channels, height, width // 2 + 1],
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        slices0 = (
+            slice(None),  # Equivalent to: [:,
+            slice(None),  # ............... :,
+            slice(self.n_modes[0] // 2),  # :half_n_modes[0],
+            slice(self.n_modes[1]),  #      :half_n_modes[1]]
+        )
+        slices1 = (
+            slice(None),  # Equivalent to:        [:,
+            slice(None),  # ...................... :,
+            slice(-self.n_modes[0] // 2, None),  # -half_n_modes[0]:,
+            slice(self.n_modes[1]),  # ......      :half_n_modes[1]]
+        )
+
+        """Upper block (truncate high frequencies)."""
+        out_fft[slices0] = self._contract(
+            x[slices0], self._get_weight(indices)[slices1], separable=self.separable
+        )
+
+        """Lower block"""
+        out_fft[slices1] = self._contract(
+            x[slices1], self._get_weight(indices)[slices0], separable=self.separable
+        )
+
+        if self.output_scaling_factor is not None:
+            width = round(width * self.output_scaling_factor[indices][0])
+            height = round(height * self.output_scaling_factor[indices][1])
+
+        x = torch.fft.irfft2(
+            out_fft, s=(height, width), dim=(-2, -1), norm=self.fft_norm
+        )
+
+        if self.bias is not None:
+            x = x + self.bias[indices, ...]
+
+        return x
